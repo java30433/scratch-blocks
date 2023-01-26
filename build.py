@@ -1,4 +1,4 @@
-#!/usr/bin/python2.7
+#!/usr/bin/python3
 # Compresses the core Blockly files into a single JavaScript file.
 #
 # Copyright 2012 Google Inc.
@@ -35,11 +35,13 @@
 #   msg/js/<LANG>.js for every language <LANG> defined in msg/js/<LANG>.json.
 
 import sys
-if sys.version_info[0] != 2:
-  raise Exception("Blockly build only compatible with Python 2.x.\n"
-                  "You are using: " + sys.version)
+# if sys.version_info[0] != 2:
+#   raise Exception("Blockly build only compatible with Python 2.x.\n"
+#                   "You are using: " + sys.version)
 
-import errno, glob, httplib, json, os, re, subprocess, threading, urllib
+import errno, glob, http.client, json, os, re, subprocess, threading, urllib
+from importlib import reload
+from functools import reduce
 
 REMOTE_COMPILER = "remote"
 
@@ -51,7 +53,29 @@ CLOSURE_COMPILER = REMOTE_COMPILER
 CLOSURE_DIR_NPM = "node_modules"
 CLOSURE_ROOT_NPM = os.path.join("node_modules")
 CLOSURE_LIBRARY_NPM = "google-closure-library"
-CLOSURE_COMPILER_NPM = ("google-closure-compiler.cmd" if os.name == "nt" else "google-closure-compiler")
+CLOSURE_COMPILER_NPM = "google-closure-compiler"
+
+def init_closure_library():
+  """Initialize the closure library for closure compiler to use.
+  Only work when the OS is windows.
+  """
+  if sys.platform != "win32": return
+  src = os.path.join(os.getcwd(), CLOSURE_ROOT_NPM, CLOSURE_LIBRARY_NPM)
+  dst = os.path.join(os.getcwd(), "..", CLOSURE_LIBRARY)
+  # adminPrefixArg = ["runas", "/env", "/noprofile", "/user:" + os.environ.get("USERNAME")]
+  args = ["cmd /c mklink /J", dst, src]
+  try:
+    if not os.path.exists(dst):
+      linkProc = subprocess.Popen(args, shell=True)
+      linkProc.wait()
+      if linkProc.returncode != 0: raise Exception
+      print("Created hard link from \"{}\" to \"{}\"".format(src, dst))
+  except:
+    print("Can not create hard link, " + 
+          "It may be that you are not run this script as an administrator.\n" + 
+          "Try run command below manually in administrator:\n" +
+          ' '.join(args))
+    exit(1)
 
 def import_path(fullpath):
   """Import a file with full path specification.
@@ -72,7 +96,7 @@ def import_path(fullpath):
   return module
 
 def read(filename):
-    f = open(filename)
+    f = open(filename, encoding='gb18030', errors='ignore')
     content = "".join(f.readlines())
     f.close()
     return content
@@ -151,7 +175,8 @@ window.BLOCKLY_BOOT = function() {
     # This allows blockly_uncompressed.js to be compiled on one computer and be
     # used on another, even if the directory name differs.
     m = re.search('[\\/]([^\\/]+)[\\/]core[\\/]blockly.js', add_dependency)
-    add_dependency = re.sub('([\\/])' + re.escape(m.group(1)) +
+    if m != None:
+      add_dependency = re.sub('([\\/])' + re.escape(m.group(1)) +
         '([\\/]core[\\/])', '\\1" + dir + "\\2', add_dependency)
     f.write(add_dependency + '\n')
 
@@ -237,9 +262,10 @@ class Gen_compressed(threading.Thread):
     else:
       target_filename = 'blockly_compressed_horizontal.js'
       search_paths = self.search_paths_horizontal
+    print("Generating " + target_filename)
     # Define the parameters for the POST request.
     params = [
-      ("compilation_level", "SIMPLE"),
+      ("compilation_level", "SIMPLE" if sys.argv.__len__() > 1 and sys.argv[1] == "production" else "SIMPLE"),
 
       # remote will filter this out
       ("language_in", "ECMASCRIPT_2017"),
@@ -250,6 +276,13 @@ class Gen_compressed(threading.Thread):
       # local will filter this out
       ("use_closure_library", "true"),
     ]
+    
+    # debug params
+    if '--debug' in sys.argv:
+      params += [
+        ("debug", "true"),
+        ("formatting", "PRETTY_PRINT")
+      ]
 
     # Read in all the source files.
     filenames = calcdeps.CalculateDependencies(search_paths,
@@ -287,7 +320,7 @@ class Gen_compressed(threading.Thread):
     # Add Blockly.Colours for use of centralized colour bank
     filenames.append(os.path.join("core", "colours.js"))
     filenames.append(os.path.join("core", "constants.js"))
-
+    
     for filename in filenames:
       # Append filenames as false arguments the step before compiling will
       # either transform them into arguments for local or remote compilation
@@ -309,6 +342,7 @@ class Gen_compressed(threading.Thread):
       self.report_stats(target_filename, json_data)
 
   def do_compile_local(self, params, target_filename):
+      import tempfile
       filter_keys = ["use_closure_library"]
 
       # Drop arg if arg is js_file else add dashes
@@ -322,14 +356,25 @@ class Gen_compressed(threading.Thread):
         if pair[0][2:] not in filter_keys:
           dash_args.extend(pair)
 
-      # Build the final args array by prepending CLOSURE_COMPILER_NPM to
+      # Build the final args array by prepending google-closure-compiler to
       # dash_args and dropping any falsy members
-      args = []
-      for group in [[CLOSURE_COMPILER_NPM], dash_args]:
-        args.extend(filter(lambda item: item, group))
+      temp_file = tempfile.NamedTemporaryFile(delete=False)
+      temp_file_name = temp_file.name
+      # args = ["google-closure-compiler", "--flagfile=" + temp_file_name]
+      args = [closure_compiler, "--flagfile=" + temp_file_name]
+      
+      if sys.platform == "win32":
+        if platform_postfix == "":
+          args[0] = os.path.join(CLOSURE_ROOT_NPM, ".bin", CLOSURE_COMPILER_NPM + ".cmd")
+      
+      for argv in dash_args:
+        temp_file.write((argv + " ").encode("utf-8"))
+      temp_file.close()
 
       proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
       (stdout, stderr) = proc.communicate()
+
+      os.remove(temp_file_name)
 
       # Build the JSON response.
       filesizes = [os.path.getsize(value) for (arg, value) in params if arg == "js_file"]
@@ -372,8 +417,8 @@ class Gen_compressed(threading.Thread):
             remoteParams.append((arg, value))
 
       headers = {"Content-type": "application/x-www-form-urlencoded"}
-      conn = httplib.HTTPSConnection("closure-compiler.appspot.com")
-      conn.request("POST", "/compile", urllib.urlencode(remoteParams), headers)
+      conn = http.client.HTTPSConnection("closure-compiler.appspot.com")
+      conn.request("POST", "/compile", urllib.parse.urlencode(remoteParams), headers)
       response = conn.getresponse()
       json_str = response.read()
       conn.close()
@@ -388,12 +433,12 @@ class Gen_compressed(threading.Thread):
       n = int(name[6:]) - 1
       return filenames[n]
 
-    if json_data.has_key("serverErrors"):
+    if "serverErrors" in json_data:
       errors = json_data["serverErrors"]
       for error in errors:
         print("SERVER ERROR: %s" % target_filename)
         print(error["error"])
-    elif json_data.has_key("errors"):
+    elif "errors" in json_data:
       errors = json_data["errors"]
       for error in errors:
         print("FATAL ERROR")
@@ -405,7 +450,7 @@ class Gen_compressed(threading.Thread):
           print((" " * error["charno"]) + "^")
         sys.exit(1)
     else:
-      if json_data.has_key("warnings"):
+      if "warnings" in json_data:
         warnings = json_data["warnings"]
         for warning in warnings:
           print("WARNING")
@@ -422,11 +467,11 @@ class Gen_compressed(threading.Thread):
     return False
 
   def write_output(self, target_filename, remove, json_data):
-      if not json_data.has_key("compiledCode"):
+      if not "compiledCode" in json_data:
         print("FATAL ERROR: Compiler did not return compiledCode.")
         sys.exit(1)
 
-      code = HEADER + "\n" + json_data["compiledCode"]
+      code = HEADER + "\n" + json_data["compiledCode"].decode('utf-8')
       code = code.replace(remove, "")
 
       # Trim down Google's (and only Google's) Apache licences.
@@ -560,11 +605,29 @@ def exclude_horizontal(item):
 
 if __name__ == "__main__":
   try:
+    init_closure_library()
     closure_dir = CLOSURE_DIR_NPM
     closure_root = CLOSURE_ROOT_NPM
     closure_library = CLOSURE_LIBRARY_NPM
     closure_compiler = CLOSURE_COMPILER_NPM
+    platform_postfix = ""
 
+    if sys.platform == "win32" or sys.platform == "cygwin":
+      platform_postfix = "-windows"
+      closure_compiler = os.path.join(CLOSURE_ROOT_NPM, CLOSURE_COMPILER_NPM + platform_postfix, "compiler.exe")
+    elif sys.platform == "linux":
+      platform_postfix = "-linux"
+      closure_compiler = os.path.join(CLOSURE_ROOT_NPM, CLOSURE_COMPILER_NPM + platform_postfix, "compiler")
+    elif sys.platform == "darwin":
+      platform_postfix = "-osx"
+      closure_compiler = os.path.join(CLOSURE_ROOT_NPM, CLOSURE_COMPILER_NPM + platform_postfix, "compiler")
+
+    if not os.path.exists(closure_compiler) and platform_postfix != "":
+      closure_compiler = os.path.join(CLOSURE_ROOT_NPM, ".bin", CLOSURE_COMPILER_NPM + ".cmd")
+      print('Using java compiler: ' + closure_compiler)
+    else:
+      print('Detected native compiler: ' + closure_compiler)
+    
     # Load calcdeps from the local library
     calcdeps = import_path(os.path.join(
         closure_root, closure_library, "closure", "bin", "calcdeps.py"))
@@ -573,10 +636,10 @@ if __name__ == "__main__":
     test_args = [closure_compiler, os.path.join("build", "test_input.js")]
     test_proc = subprocess.Popen(test_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     (stdout, _) = test_proc.communicate()
-    assert stdout == read(os.path.join("build", "test_expect.js"))
+    assert stdout == read(os.path.join("build", "test_expect.js")).encode('utf-8')
 
-    print("Using local compiler: %s ...\n" % CLOSURE_COMPILER_NPM)
-  except (ImportError, AssertionError):
+    print("Using local compiler: google-closure-compiler ...\n")
+  except (ImportError, AssertionError, WindowsError):
     print("Using remote compiler: closure-compiler.appspot.com ...\n")
 
     try:
@@ -602,11 +665,10 @@ if __name__ == "__main__":
   developers.google.com/blockly/guides/modify/web/closure""")
       sys.exit(1)
 
-  search_paths = calcdeps.ExpandDirectories(
-      ["core", os.path.join(closure_root, closure_library)])
-
-  search_paths_horizontal = filter(exclude_vertical, search_paths)
-  search_paths_vertical = filter(exclude_horizontal, search_paths)
+  search_paths = list(calcdeps.ExpandDirectories(
+      ["core", os.path.join(closure_root, closure_library)]))
+  search_paths_horizontal = list(filter(exclude_vertical, search_paths))
+  search_paths_vertical = list(filter(exclude_horizontal, search_paths))
 
   closure_env = {
     "closure_dir": closure_dir,
@@ -615,16 +677,25 @@ if __name__ == "__main__":
     "closure_compiler": closure_compiler,
   }
 
+  threads = []
+
   # Run all tasks in parallel threads.
   # Uncompressed is limited by processor speed.
   # Compressed is limited by network and server speed.
   # Vertical:
-  Gen_uncompressed(search_paths_vertical, True, closure_env).start()
+  threads.append(Gen_uncompressed(search_paths_vertical, True, closure_env))
   # Horizontal:
-  Gen_uncompressed(search_paths_horizontal, False, closure_env).start()
+  threads.append(Gen_uncompressed(search_paths_horizontal, False, closure_env))
 
   # Compressed forms of vertical and horizontal.
-  Gen_compressed(search_paths_vertical, search_paths_horizontal, closure_env).start()
+  threads.append(Gen_compressed(search_paths_vertical, search_paths_horizontal, closure_env))
 
   # This is run locally in a separate thread.
-  # Gen_langfiles().start()
+  threads.append(Gen_langfiles())
+
+  for t in threads:
+    t.start()
+  for t in threads:
+    t.join()
+  print("Closure compile finished.")
+  
